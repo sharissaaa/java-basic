@@ -1,0 +1,114 @@
+.carousel-item img {
+    height: 300px;
+    width: 20px;
+    object-fit: cover; /* Maintain aspect ratio */
+  }
+
+  .header {
+    background-color: rgba(0, 0, 0, 0.5); /* Add a semi-transparent background for better readability */
+    color: #fff;
+    padding: 20px;
+    text-align: center;
+    position: fixed;
+    top: 0;
+    width: 100%;
+}
+.footer {
+  background-color: rgba(0, 0, 0, 0.5); /* Add a semi-transparent background for better readability */
+  color: #fff;
+  padding: 20px;
+  text-align: center;
+  position: fixed;
+  bottom: 0;
+  width: 100%;
+}
+
+
+
+/* CSS Styles */
+body {
+  font-family: Arial, sans-serif;
+  margin: 0;
+  padding: 0;
+  background-image: url('pro4.jpg'); /* Replace 'background.jpg' with your image file */
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  color:#fff;
+}
+
+.header {
+  background-color: rgba(0, 0, 0, 0.5); /* Add a semi-transparent background for better readability */
+  color: #fff;
+  padding: 20px;
+  text-align: center;
+}
+
+.main {
+            padding: 100px 20px 20px; /* Adjusted padding to create space between navbar and header */
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+.section {
+  background-color: rgba(255, 255, 255, 0.8); /* Add a semi-transparent background for better readability */
+  border-radius: 5px;
+  margin-bottom: 20px;
+  padding: 20px;
+  box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+}
+
+.h1, h2 {
+  color: #333;
+}
+
+.footer2 {
+  background-color: rgba(0, 0, 0, 0.5); /* Add a semi-transparent background for better readability */
+  color: #fff;
+  padding: 20px;
+  text-align: center;
+  position: fixed;
+  bottom: 0;
+  width: 100%;
+}
+
+
+
+/*        */
+
+nav ul {
+  list-style-type: none;
+  margin: 0;
+  padding: 0;
+}
+
+nav ul li {
+  display: inline;
+  margin-right: 20px;
+}
+
+nav ul li a {
+  color: #fff;
+  text-decoration: none;
+}
+
+.section {
+  background-color: rgba(0, 0, 0, 0.5); /* Add a semi-transparent background for better readability */
+  border-radius: 5px;
+  margin-bottom: 20px;
+  padding: 20px;
+}
+
+h1, h2, h3, h4 {
+  color: #fff;
+}
+
+.footer {
+  background-color: rgba(0, 0, 0, 0.5); /* Add a semi-transparent background for better readability */
+  color: #fff;
+  padding: 20px;
+  text-align: center;
+  position: fixed;
+  bottom: 0;
+  width: 100%;
+}

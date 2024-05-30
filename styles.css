@@ -1,0 +1,105 @@
+/* index.css */
+
+body {
+    font-family: Arial, sans-serif;
+    margin: 0;
+    padding: 0;
+    background-image: url('C:\\Users\\shari\\OneDrive\\Desktop\\intership\\routine1 (3)\\background.jpg'); /* Path to the background image */
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    padding-top: 76px; /* Height of navbar (56px) + padding for header (20px) */
+}
+
+.navbar {
+    z-index: 1000; /* Ensure navbar stays on top */
+}
+
+header {
+    background-color: rgba(0, 0, 0, 0.5); /* Add a semi-transparent background for better readability */
+    padding: 20px;
+    text-align: center;
+    width: 100%;
+    position: fixed;
+    top: 56px; /* Height of the navbar */
+}
+
+footer {
+    background-color: rgba(0, 0, 0, 0.5); /* Add a semi-transparent background for better readability */
+    color: #fff;
+    padding: 2px;
+    text-align: center;
+    position: fixed;
+    bottom: 0;
+    width: 100%;
+}
+
+.container {
+    max-width: 600px;
+    margin: 150px auto 50px; /* Adjust margin to add space between header and form */
+    background-color: rgba(255, 255, 255, 0.8); /* Added background color with opacity */
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+/* styles.css */
+
+/* Style for header */
+header {
+    background-color: #343a40; /* Dark background color */
+    color: #fff; /* White text color */
+    padding: 20px 0; /* Padding for top and bottom */
+    text-align: center;
+}
+
+/* Style for form container */
+.container {
+    max-width: 600px; /* Adjust max-width as needed */
+    margin: 50px auto; /* Center the container and provide space from top */
+    padding: 30px; /* Add padding for spacing */
+    background-color: #fff; /* White background color */
+    border-radius: 8px; /* Rounded corners */
+    box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); /* Add shadow for depth */
+}
+
+/* Style for form labels */
+.form-label {
+    font-weight: bold; /* Bold text */
+    color: #333; /* Dark text color */
+}
+
+/* Style for form input fields */
+.form-control {
+    width: 100%; /* Full width */
+    padding: 12px; /* Padding for input fields */
+    margin-bottom: 20px; /* Spacing between input fields */
+    border: 1px solid #ced4da; /* Border color */
+    border-radius: 4px; /* Rounded corners */
+    box-sizing: border-box; /* Include padding and border in width calculation */
+    transition: border-color 0.3s; /* Smooth transition for border color */
+}
+
+/* Style for form input fields on focus */
+.form-control:focus {
+    outline: none; /* Remove default focus outline */
+    border-color: #007bff; /* Change border color on focus */
+    box-shadow: 0 0 0 0.2rem rgba(0, 123, 255, 0.25); /* Add shadow on focus for accessibility */
+}
+
+/* Style for form button */
+.btn-primary {
+    background-color: #007bff; /* Primary button color */
+    color: #fff; /* White text color */
+    border: none; /* Remove border */
+    padding: 12px 24px; /* Padding for button */
+    border-radius: 4px; /* Rounded corners */
+    cursor: pointer; /* Cursor style */
+    transition: background-color 0.3s; /* Smooth transition for background color */
+}
+
+/* Style for form button on hover */
+.btn-primary:hover {
+    background-color: #0056b3; /* Darker color on hover */
+}
+
