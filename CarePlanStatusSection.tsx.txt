@@ -1,0 +1,50 @@
+// CarePlanStatusSection.tsx
+import React from "react";
+
+export default function CarePlanStatusSection({ goals, statusData, onEditStatus }) {
+  return (
+    <div className="bg-white dark:bg-gray-800 rounded-xl shadow-lg p-6 mb-8">
+      <h2 className="text-2xl font-bold text-gray-900 dark:text-white mb-4">
+        Care Plan Status
+      </h2>
+      {goals.map((goal) => {
+        const status = statusData?.[goal.id] || {};
+        return (
+          <div key={goal.id} className="mb-6 border-b pb-4">
+            <h3 className="font-semibold text-blue-700 dark:text-blue-300">{goal.needs_category}</h3>
+            <p className="text-gray-600 dark:text-gray-300 text-sm mb-1">{goal.goal}</p>
+
+            <div className="flex flex-col gap-3 mt-3">
+              <div>
+                <label className="font-medium">Goal Progress:</label>
+                <select className="ml-2" value={status.goal_progress || ""} disabled>
+                  <option value="">-- Select --</option>
+                  {[5, 4, 3, 2, 1].map((v) => (
+                    <option key={v} value={v}>{v}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="font-medium">Barriers:</label>
+                <span className="ml-2 text-sm italic text-gray-400">({(status.barriers || []).join(", ") || "N/A"})</span>
+              </div>
+
+              <div>
+                <label className="font-medium">Comments:</label>
+                <p className="ml-2 text-gray-700 dark:text-gray-200 text-sm">{status.comments || "N/A"}</p>
+              </div>
+
+              <button
+                onClick={() => onEditStatus(goal.id)}
+                className="mt-2 inline-block text-blue-600 hover:underline text-sm"
+              >
+                Edit Status
+              </button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
