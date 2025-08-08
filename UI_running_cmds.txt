@@ -1,0 +1,19 @@
+1)In the cmd run this-
+npx expo --version
+
+2)npm config get prefix
+This will show a path like C:\Users\YourUsername\AppData\Roaming\npm
+
+Add this path to your system's PATH environment variable:
+
+3)cd Frontend\RHealthApp
+npx expo start
+
+
+4)Navigate to your project folder :
+npm install expo
+npm install expo-constants expo-updates
+npm install expo-constants expo-updates
+
+
+npx expo start -c
