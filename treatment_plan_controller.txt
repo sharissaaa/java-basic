@@ -1,0 +1,1134 @@
+import asyncio
+import os
+import re
+import json
+import openai
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from models.patient import Patient
+from datetime import date, timedelta
+from models.reminder import Reminder
+from typing import Any, Dict, List, Optional
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import func
+from fastapi import status, Request, HTTPException
+from controllers import staff_activity_log_controller
+from models.patient_observation_model import PatientObservation
+from models.institution.institution_services_model import InstitutionService
+from schemas.staff_activity_log import StaffActionEnum, StaffActivityLogCreate
+from schemas.treatment_plan_schemas import CarePlanGoalUpdate, TreatmentPlanUpdate, GoalReorderRequest, CarePlanGoalCreate 
+from models.patient_treatment_plan_model import CarePlanGoal, TreatmentPlan, AssessmentChangeSummary
+from models.assessment import PatientAssessment, AssessmentQuestion, PatientAssessmentScore, PatientAssessmentResponse
+from models.care_plan_status_model import CarePlanStatus
+from schemas.staff_activity_log import StaffActionEnum
+
+# --- Load and Configure AI ---
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY environment variable not set.")
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+
+# =========================================================================
+# === AI & DATA HELPER FUNCTIONS
+# =========================================================================
+
+def get_scores_for_assessment(db: Session, assessment_id: int) -> List[Dict[str, Any]]:
+    """Fetches all scores for a given assessment session."""
+    scores = db.query(PatientAssessmentScore).filter(PatientAssessmentScore.patient_assessment_id == assessment_id).all()
+    return [{"domain": s.domain, "score": s.score, "interpretation": s.score_interpretation} for s in scores]
+
+def get_recent_observations(db: Session, patient_id: int) -> Optional[PatientObservation]: # MODIFIED: return Optional[PatientObservation]
+    """Fetches the most recent observation for a patient."""
+    return db.query(PatientObservation).filter(PatientObservation.patient_id == patient_id).order_by(PatientObservation.observation_date.desc()).first() # MODIFIED: .first() instead of .limit(3).all() if only one is needed for status
+
+def get_institution_services(db: Session, institution_id: int) -> List[Dict[str, Any]]:
+    """Fetches all available services for an institution as a list of dictionaries."""
+    services = db.query(InstitutionService).filter(InstitutionService.institution_id == institution_id).all()
+    return [
+        {
+            "service_name": s.service_name,
+            "frequency": s.frequency,
+            "description": s.description
+        }
+        for s in services
+    ]
+
+def get_detailed_assessment_responses(db: Session, patient_assessment_id: int) -> List[Dict[str, Any]]:
+    """
+    Fetches all detailed responses for a given patient assessment,
+    including question text, response value, and selected checklist options.
+    """
+    responses = db.query(PatientAssessmentResponse).options(
+        joinedload(PatientAssessmentResponse.question)
+    ).filter(PatientAssessmentResponse.patient_assessment_id == patient_assessment_id).all()
+
+    formatted_responses = []
+    for r in responses:
+        response_data = {
+            "question_code": r.question.question_code,
+            "question_text": r.question.question_text,
+            "domain": r.question.domain,
+            "response_value": r.response_value,
+            "response_type": r.question.response_type,
+            "selected_checklist_options": r.selected_checklist_options if r.selected_checklist_options else []
+        }
+        formatted_responses.append(response_data)
+    return formatted_responses
+
+def get_previous_plan_details(db: Session, previous_assessment_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Fetches the previous treatment plan and the latest status for each of its goals.
+    """
+    previous_plan = db.query(TreatmentPlan).filter(
+        TreatmentPlan.patient_assessment_id == previous_assessment_id
+    ).options(joinedload(TreatmentPlan.goals)).first()
+
+    if not previous_plan:
+        return None
+
+    goals_with_status = []
+    for goal in previous_plan.goals:
+        latest_status = db.query(CarePlanStatus).filter(
+            CarePlanStatus.care_plan_goal_id == goal.id
+        ).order_by(CarePlanStatus.created_at.desc()).first()
+        
+        goals_with_status.append({
+            "goal": goal.goal,
+            "intervention": goal.intervention,
+            "latest_progress": latest_status.goal_progress if latest_status else "Not updated",
+            "latest_adherence": latest_status.intervention_adherence if latest_status else "Not updated",
+            "comments": latest_status.progress_comments if latest_status else "No comments."
+        })
+        
+    return {"goals": goals_with_status}
+
+def extract_json_from_response(response_text: str) -> Dict[str, Any]:
+    """Extracts JSON data from AI response text, cleaning up markdown if present."""
+    try:
+        return json.loads(response_text.strip())
+    except json.JSONDecodeError:
+        json_match = re.search(r'```(?:json)?\s*\n?({.*?})\s*```', response_text, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group(1))
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Failed to decode JSON from markdown block: {e}")
+        raise ValueError("Could not find or parse JSON in the AI response.")
+
+
+def create_progress_analysis_prompt(previous_scores: List[Dict], current_scores: List[Dict]) -> str:
+    """Creates the prompt to generate a progress analysis summary between two assessments."""
+    previous_scores_text = "\n".join([f"- {s['domain']}: {s['score']} ({s['interpretation']})" for s in previous_scores])
+    current_scores_text = "\n".join([f"- {s['domain']}: {s['score']} ({s['interpretation']})" for s in current_scores])
+    prompt = f"""
+    You are a clinical assessment analyst. Compare the following two assessments and provide a detailed analysis of changes.
+    PREVIOUS ASSESSMENT SCORES:
+    {previous_scores_text}
+    CURRENT ASSESSMENT SCORES:
+    {current_scores_text}
+    Please analyze the changes and respond ONLY with a single valid JSON object containing:
+    1. "changes_summary": A brief overall summary of the resident's progress.
+    2. "domain_improvements": List of domains that improved (domain names only).
+    3. "domain_no_change": List of domains that showed no significant change (domain names only).
+    4. "domain_worsened": List of domains that worsened (domain names only).
+    """
+    return prompt
+
+
+def create_detailed_progress_analysis_prompt(
+    patient_details: Dict[str, Any],
+    previous_scores: List[Dict],
+    current_scores: List[Dict],
+    observations: Optional[PatientObservation],
+    previous_plan_details: Optional[Dict[str, Any]]
+) -> str:
+    """
+    Creates a prompt for a holistic, domain-by-domain progress analysis,
+    structuring the output into distinct sections.
+    """
+    patient_context_text = f"The resident is a {patient_details.get('age')}-year-old {patient_details.get('gender')} with a diagnosis of {patient_details.get('current_provisional_diagnosis', 'N/A')}."
+    previous_scores_text = "\n".join([f"- {s['domain']}: {s['score']} ({s['interpretation']})" for s in previous_scores])
+    current_scores_text = "\n".join([f"- {s['domain']}: {s['score']} ({s['interpretation']})" for s in current_scores])
+    
+    observations_text = "No recent clinical observations were recorded between assessments."
+    if observations:
+        observations_text = f"The most recent clinical observation notes a status of '{observations.psychopathology_status}' with the following comment: '{observations.observation_notes or 'No specific notes.'}'"
+        
+    previous_plan_text = "No previous care plan was provided for review."
+    if previous_plan_details and previous_plan_details.get("goals"):
+        previous_plan_text = "--- REVIEW OF PREVIOUS CARE PLAN GOALS ---\n"
+        for goal_detail in previous_plan_details["goals"]:
+            previous_plan_text += f"- Goal: {goal_detail['goal']}\n"
+            previous_plan_text += f"  - Last Recorded Progress: {goal_detail['latest_progress']}\n"
+            previous_plan_text += f"  - Staff Comments: {goal_detail['comments']}\n\n"
+
+    prompt = f"""
+    You are an expert clinical data analyst from Valat, Kerala, specializing in mental health assessments.
+    Your task is to compare two assessments and generate a detailed, structured progress report.
+
+    --- RESIDENT AND CONTEXT ---
+    {patient_context_text}
+    {observations_text}
+
+    --- PREVIOUS & CURRENT ASSESSMENT SCORES ---
+    Previous:
+    {previous_scores_text}
+    Current:
+    {current_scores_text}
+
+    {previous_plan_text}
+
+    **--- INSTRUCTIONS ---**
+    Your response MUST be a single, valid JSON object. The JSON object should have the following top-level keys.
+
+    1.  `overall_summary`: A very brief, high-level executive summary (2-3 sentences) of the resident's overall trajectory.
+    2.  `key_observational_insights`: A paragraph analyzing any changes or notable points from the clinical observations. Connect these observations to the resident's current state or assessment scores. If there are no observations, provide an empty string "".
+    3.  `previous_plan_review`: A paragraph summarizing the resident's performance against their previous care plan goals. Highlight what was achieved and what areas need continued focus. If there was no previous plan, provide an empty string "".
+    4.  `domain_analysis`: An array of objects, one for each assessment domain, containing `domain_name`, `previous_score`, `current_score`, `change_status`, and a brief one-sentence `analysis`.
+
+    **--- EXAMPLE OF CORRECT JSON STRUCTURE ---**
+    ```json
+    {{
+        "overall_summary": "The resident shows a positive trend with marked improvements in self-care, though social functioning remains a key area for intervention.",
+        "key_observational_insights": "Clinical observations note a calmer demeanor and increased engagement in daily activities, which correlates with the improved WHODAS scores in self-care and life activities. The noted irritability in group settings, however, may explain the decline in the social participation domain.",
+        "previous_plan_review": "The resident successfully achieved the goal related to medication adherence. However, the goal for attending weekly group therapy was not met, indicating a potential barrier or lack of interest that should be addressed in the next care plan.",
+        "domain_analysis": [
+            {{
+                "domain_name": "WHODAS 2.0 Overall Score",
+                "previous_score": 45.0,
+                "current_score": 38.0,
+                "change_status": "Improved",
+                "analysis": "Overall functioning has improved, reflecting gains in several key life areas."
+            }}
+        ]
+    }}
+    ```
+    Now, generate the complete JSON object based on all rules and the provided context.
+    """
+    return prompt
+
+def create_structured_json_prompt(
+    patient_details: dict,
+    assessment_scores: list,
+    observations: Optional[PatientObservation],
+    services: list,
+    progress_analysis: Optional[dict],
+    detailed_responses: List[Dict[str, Any]],
+    previous_plan_details: Optional[Dict[str, Any]] # Argument for previous plan data
+) -> str:
+    """
+    Creates the most forceful and explicit prompt to ensure the AI returns a
+    deeply nested and detailed JSON object for the structured care plan,
+    adhering to specific operational guidelines.
+    """
+    assessment_scores_text = "\n".join([f"- {s['domain']}: {s['score']} ({s['interpretation']})" for s in assessment_scores])
+
+    if observations:
+        obs = observations
+        observations_text = f"- {obs.observation_date.strftime('%Y-%m-%d')}: (Status: {obs.psychopathology_status}) {obs.observation_notes or 'N/A'}"
+    else:
+        observations_text = "No recent observations."
+
+    services_text = "\n".join([f"- {s['service_name']}: (Frequency: {s['frequency'] or 'N/A'}) {s['description'] or ''}" for s in services]) if services else "No specific services listed."
+
+    progress_text = ""
+    if progress_analysis and progress_analysis.get("changes_summary"):
+        progress_text = f'--- RECENT PROGRESS ANALYSIS (for context) ---\nSummary: {progress_analysis.get("changes_summary")}'
+
+    patient_context_text = "\n".join([f"- {key.replace('_', ' ').title()}: {value}" for key, value in patient_details.items() if value is not None])
+
+    detailed_responses_text = ""
+    if detailed_responses:
+        detailed_responses_text = "--- DETAILED ASSESSMENT RESPONSES (WHODAS 2.0, SOFS, WHOQoL-BREF) ---\n"
+        for response in detailed_responses:
+            question_text = response.get("question_text", "N/A")
+            response_value = response.get("response_value", "N/A")
+            domain = response.get("domain", "N/A")
+            checklist_options = response.get("selected_checklist_options")
+
+            detailed_responses_text += f"- Question (Domain: {domain}): \"{question_text}\"\n"
+            detailed_responses_text += f"  Response: {response_value}\n"
+            if checklist_options:
+                try:
+                    if isinstance(checklist_options, list):
+                        options_str = ', '.join(checklist_options)
+                    else:
+                        parsed_list = json.loads(checklist_options)
+                        options_str = ', '.join(parsed_list) if isinstance(parsed_list, list) else str(parsed_list)
+                    detailed_responses_text += f"  Specific Impairments/Checklist: {options_str}\n"
+                except (json.JSONDecodeError, TypeError):
+                    detailed_responses_text += f"  Specific Impairments/Checklist: {checklist_options}\n"
+            detailed_responses_text += "\n"
+
+    # --- THIS SECTION FORMATS THE PREVIOUS PLAN'S DATA ---
+    previous_plan_text = "No previous care plan was provided for review."
+    if previous_plan_details and previous_plan_details.get("goals"):
+        previous_plan_text = "--- PREVIOUS CARE PLAN & PROGRESS ---\n"
+        for goal_detail in previous_plan_details["goals"]:
+            previous_plan_text += f"- Goal: {goal_detail['goal']}\n"
+            previous_plan_text += f"  - Intervention: {goal_detail['intervention']}\n"
+            previous_plan_text += f"  - Last Recorded Progress: {goal_detail['latest_progress']}\n"
+            previous_plan_text += f"  - Last Recorded Adherence: {goal_detail['latest_adherence']}\n"
+            previous_plan_text += f"  - Last Comment: {goal_detail['comments']}\n\n"
+
+    context = f"""
+    --- ORGANIZATION & RESIDENT PROFILE ---
+    {patient_context_text}
+
+    --- ASSESSMENT RESULTS & SCORES ---
+    {assessment_scores_text}
+    {detailed_responses_text}
+
+    --- CLINICAL OBSERVATIONS & HEALTH STATUS ---
+    {observations_text}
+    
+    {previous_plan_text}
+
+    --- AVAILABLE ORGANIZATIONAL RESOURCES & SERVICES ---
+    {services_text}
+
+    {progress_text}
+    """
+
+    prompt = f"""
+    You are an AI Assistant for a mental health rehabilitation center in Kerala, specializing in providing care for homeless individuals with mental illness. Your task is to generate a comprehensive, personalized care plan based on the provided resident's data, assessment results, and the organization's available resources. Maintain a professional, empathetic, and clinically informed tone.
+
+    Your ONLY function is to generate a single, valid JSON object. Your output MUST strictly follow all rules and the format described below.
+
+    **--- TASK INSTRUCTIONS & RULES ---**
+
+    **RULE 1: IDENTIFY AND PRIORITIZE NEEDS**
+    Analyze all provided data to identify needs. You MUST prioritize needs in this specific order:
+    1.  **Immediate Safety/Crisis**
+    2.  **Psychiatric Stability**
+    3.  **Fundamental Needs** (Self-Care, Mobility, Medication Adherence)
+    4.  **Functional & Social Needs** (Life Activities, Social Participation, etc.)
+
+    **RULE 2: CATEGORIZE NEEDS**
+    You MUST categorize every identified need into one of the following domains: "Pharmacological", "Cognitive", "Mobility", "Self-Care", "Life Activities and Skills", "Social Life and Relationships", "Participation", "Other Needs". These will be the keys in the final `care_plan` object.
+
+    **RULE 3: GOAL FORMULATION (OBJECTIVE-FOCUSED)**
+    - For each need, you MUST draft a concise, high-level goal.
+    - **Goal Phrasing Style:** The `goal` MUST be a single, short sentence starting with "To...". It should state the main clinical or functional objective.
+    - **DO NOT** include measurement criteria (like frequency, duration, or specific actions) in the `goal` string. These details belong in the `intervention` field.
+    - **CORRECT Goal Example:** "To improve social interaction skills and build positive relationships."
+    - **INCORRECT Goal Example:** "To improve social skills by participating in one group session per week."
+
+    **RULE 4: INTERVENTION FORMULATION (MEASURABLE ACTIONS)**
+    - For each goal, you MUST propose a concrete, measurable intervention.
+    - **Therapeutic Basis:** Therapeutic interventions should be based on cognitive behavioural therapy (CBT), psychotherapy, and family intervention as applicable. You MUST adopt a strength-based approach, building on the resident's existing capabilities.
+    - **Resource Alignment:** Interventions must align with the resident's profile and the services listed under `--- AVAILABLE ORGANIZATIONAL RESOURCES & SERVICES ---`. Recommend activities that can be implemented within the organization to improve physical and mental health.
+    - **External Referrals:** If a necessary intervention (e.g., specialized medical treatment, de-addiction services) is beyond the organization's available resources, you MUST formulate the intervention as a "Referral to external resources". For example: "Referral to Government Hospital for specialized neurological assessment."
+    - **Intervention Phrasing Template:** You MUST use this exact template: "Resident will [activity/intervention] with [relevant level of support] for [frequency] within [timeframe]."
+
+    **RULE 5: RATIONALE**
+    - For each intervention, you MUST provide a brief rationale explaining how it addresses the specific need.
+    - **Crucially, if an intervention is an external referral, the `rationale` MUST explicitly state the lack of specific resources at the organization that necessitates this referral.** For example: "The organization lacks the specialized diagnostic equipment and neurological expertise required for this assessment."
+
+    **RULE 6: JSON OUTPUT STRUCTURE**
+    - The root of the JSON object MUST have these keys: "brief_background_summary", "disability_and_functioning_summary", "strengths_and_aspirations_summary", "risks_and_concerns", and "care_plan".
+    - "risks_and_concerns" must be an array of strings.
+    - The "care_plan" value MUST be an object where keys are the categories from RULE 2.
+    - Each item within a category array must be an object with these exact keys: "identified_need", "goal", "intervention", and "rationale".
+
+    --- EXAMPLE OF CORRECT OUTPUT STRUCTURE ---
+    ```json
+    {{
+      "brief_background_summary": "...",
+      "disability_and_functioning_summary": "...",
+      "strengths_and_aspirations_summary": "...",
+      "risks_and_concerns": ["History of medication non-adherence.", "Potential for conflict with peers."],
+      "care_plan": {{
+        "Pharmacological": [
+          {{
+            "identified_need": "Consistent adherence to prescribed psychiatric and diabetic medications.",
+            "goal": "To achieve consistent adherence with prescribed medications.",
+            "intervention": "Resident will take all prescribed medications under direct supervision of nursing staff daily for the next 12 weeks.",
+            "rationale": "Supervised administration addresses the history of non-adherence, a major risk factor for relapse, and helps stabilize both psychiatric and physical health."
+          }}
+        ],
+        "Social Life and Relationships": [
+          {{
+            "identified_need": "Difficulty maintaining friendships and engaging with peers.",
+            "goal": "To improve social interaction skills and build positive relationships.",
+            "intervention": "Resident will actively participate in at least one group therapy session with staff observation weekly for the next 8 weeks.",
+            "rationale": "CBT-based group therapy provides a structured environment to practice social skills, challenge negative social cognitions, and address withdrawal, leveraging the available group session service."
+          }}
+        ],
+        "Other Needs": [
+          {{
+            "identified_need": "Need for specialized ophthalmology consultation for vision complaints.",
+            "goal": "To assess and address reported vision problems.",
+            "intervention": "Referral to District Government Hospital for a comprehensive ophthalmology examination with staff accompaniment within the next 4 weeks.",
+            "rationale": "The organization lacks specialized ophthalmology services and equipment. An external referral is necessary for accurate diagnosis and treatment of the resident's vision issues."
+          }}
+        ]
+      }}
+    }}
+    ```
+    --- END OF EXAMPLE ---
+
+    Now, generate the complete JSON object based on all rules, the example, and the following context. Do not output any text other than the single, valid JSON object.
+
+    {context}
+    """
+    return prompt
+
+
+# =========================================================================
+# === CORE AI-POWERED CREATION FUNCTION
+# =========================================================================
+
+
+async def generate_and_save_ai_plan(db: Session, patient_id: int, current_assessment_id: int, actor_staff_id: int, request: Request) -> Dict[str, Any]:
+    """
+    Orchestrates care plan generation with enhanced network error handling.
+    Implements retry logic for API calls and better error reporting.
+    """
+    MAX_RETRIES = 3
+    RETRY_DELAY = 2  # seconds
+    
+    async def call_openai_with_retry(messages: List[Dict[str, str]], response_format: Dict[str, str], max_retries: int = MAX_RETRIES) -> Dict[str, Any]:
+        """Helper function to handle OpenAI API calls with retry logic"""
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                response = await client.chat.completions.create(
+                    model="gpt-4.1",
+                    messages=messages,
+                    response_format=response_format,
+                    temperature=0.7
+                )
+                return extract_json_from_response(response.choices[0].message.content)
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    await asyncio.sleep(RETRY_DELAY)
+                continue
+        
+        # If all retries failed
+        error_log = StaffActivityLogCreate(
+            staff_id=actor_staff_id,
+            action=StaffActionEnum.system_error,
+            table_name="treatment_plans",
+            details=f"OpenAI API failed after {max_retries} attempts for patient ID: {patient_id}",
+            ip_address=request.client.host
+        )
+        staff_activity_log_controller.create_activity_log(db, log_data=error_log)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"AI service unavailable after {max_retries} attempts. Please try again later."
+        )
+
+    try:
+        # --- Check for existing plan ---
+        if db.query(TreatmentPlan).filter(TreatmentPlan.patient_assessment_id == current_assessment_id).first():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"A treatment plan already exists for assessment ID {current_assessment_id}."
+            )
+
+        # --- Gather patient data ---
+        patient = db.query(Patient).filter(Patient.id == patient_id).first()
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found.")
+        
+        fields_to_include = [
+            'id', # Using the numeric ID is fine as a non-identifiable reference
+            'age',
+            'gender',
+            'date_of_admission',
+            'current_provisional_diagnosis',
+            'known_comorbidities'
+            # Add any other clinically relevant, non-identifying fields here
+        ]
+        patient_details = {
+            field: getattr(patient, field) 
+            for field in fields_to_include 
+            if hasattr(patient, field)
+        }        
+        observations = get_recent_observations(db, patient_id)
+        
+        # --- Progress analysis setup ---
+        new_summary_id = None
+        progress_analysis_data = None
+        previous_plan_details = None
+
+        # --- Get previous assessment if available ---
+        all_assessments = db.query(PatientAssessment).filter(
+            PatientAssessment.patient_id == patient_id, 
+            PatientAssessment.status == 'completed'
+        ).order_by(
+            PatientAssessment.assessment_date.desc(), 
+            PatientAssessment.created_at.desc()
+        ).all()
+
+        current_assessment_index = next(
+            (idx for idx, asmnt in enumerate(all_assessments) 
+            if asmnt.id == current_assessment_id), 
+            None
+        )
+
+        # --- Generate progress analysis if previous assessment exists ---
+        if current_assessment_index is not None and current_assessment_index < len(all_assessments) - 1:
+            previous_assessment = all_assessments[current_assessment_index + 1]
+            if previous_assessment:
+                previous_plan_details = get_previous_plan_details(db, previous_assessment.id)
+                
+                try:
+                    current_scores = get_scores_for_assessment(db, current_assessment_id)
+                    previous_scores = get_scores_for_assessment(db, previous_assessment.id)
+
+                    analysis_prompt = create_detailed_progress_analysis_prompt(
+                        patient_details=patient_details,
+                        previous_scores=previous_scores,
+                        current_scores=current_scores,
+                        observations=observations,
+                        previous_plan_details=previous_plan_details
+                    )
+
+                    progress_analysis_data = await call_openai_with_retry(
+                        messages=[
+                            {"role": "system", "content": "You are a helpful assistant designed to output JSON."},
+                            {"role": "user", "content": analysis_prompt}
+                        ],
+                        response_format={"type": "json_object"}
+                    )
+
+                    # Save progress analysis
+                    db_summary = AssessmentChangeSummary(
+                        patient_id=patient_id,
+                        previous_assessment_id=previous_assessment.id,
+                        current_assessment_id=current_assessment_id,
+                        changes_summary=json.dumps(progress_analysis_data),
+                        created_by_staff_id=actor_staff_id,
+                        generated_by_ai=True
+                    )
+                    db.add(db_summary)
+                    db.flush()
+                    new_summary_id = db_summary.id
+
+                except HTTPException:
+                    raise
+                except Exception:
+                    db.rollback()
+                    # Continue without progress analysis rather than failing completely
+
+        # --- Prepare main care plan generation ---
+        current_scores_full = get_scores_for_assessment(db, current_assessment_id)
+        services = get_institution_services(db, patient.institution_id)
+        detailed_assessment_responses = get_detailed_assessment_responses(db, current_assessment_id)
+
+        # --- Generate main care plan with retry ---
+        plan_prompt = create_structured_json_prompt(
+            patient_details,
+            current_scores_full,
+            observations,
+            services,
+            progress_analysis_data,
+            detailed_assessment_responses,
+            previous_plan_details
+        )
+        
+        try:
+            ai_plan_json = await call_openai_with_retry(
+                messages=[
+                    {"role": "system", "content": "You are a clinical care planning AI specialist designed to output a single, structured JSON object."},
+                    {"role": "user", "content": plan_prompt}
+                ],
+                response_format={"type": "json_object"}
+            )
+            
+            care_plan_object = ai_plan_json.get("care_plan")
+            if not isinstance(care_plan_object, dict):
+                raise ValueError("Invalid care plan structure from AI")
+
+        except HTTPException as he:
+            raise he
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to generate care plan content. Please try again later."
+            )
+
+        # --- Save the generated plan ---
+        try:
+            latest_plan = db.query(TreatmentPlan).filter(
+                TreatmentPlan.patient_id == patient_id
+            ).order_by(
+                TreatmentPlan.version_number.desc()
+            ).first()
+            
+            new_version_number = (latest_plan.version_number + 1) if latest_plan else 1
+            review_date = date.today() + timedelta(days=90)
+
+            risks_data = ai_plan_json.get("risks_and_concerns")
+            risks_string = "\n".join(f"- {item}" for item in risks_data) if isinstance(risks_data, list) else str(risks_data or '')
+
+            # Create treatment plan
+            db_plan = TreatmentPlan(
+                patient_id=patient_id,
+                patient_assessment_id=current_assessment_id,
+                assessment_change_summary_id=new_summary_id,
+                created_by_staff_id=actor_staff_id,
+                version_number=new_version_number,
+                plan_start_date=date.today(),
+                review_date=review_date,
+                ai_model_version="gpt-4.1",
+                status='active',
+                brief_background_summary=ai_plan_json.get("brief_background_summary"),
+                disability_and_functioning_summary=ai_plan_json.get("disability_and_functioning_summary"),
+                strengths_and_aspirations_summary=ai_plan_json.get("strengths_and_aspirations_summary"),
+                risks_and_concerns=risks_string,
+            )
+            db.add(db_plan)
+            db.flush()
+
+            # Add all goals
+            display_order_counter = 0
+            for category_name, needs_array in care_plan_object.items():
+                if not isinstance(needs_array, list):
+                    continue
+                for goal_data in needs_array:
+                    db.add(CarePlanGoal(
+                        treatment_plan_id=db_plan.id,
+                        needs_category=goal_data.get('identified_need', 'N/A'),
+                        goal=goal_data.get("goal"),
+                        intervention=goal_data.get("intervention"),
+                        rationale=goal_data.get("rationale"),
+                        display_order=display_order_counter
+                    ))
+                    display_order_counter += 1
+
+            # Create review reminder
+            review_reminder = Reminder(
+                institution_id=patient.institution_id,
+                patient_id=patient_id,
+                staff_id=actor_staff_id,
+                reminder_text=f"Care plan review due for resident (ID: {patient_id})",
+                reminder_date=review_date,
+                status='pending'
+            )
+            db.add(review_reminder)
+
+            db.commit()
+
+            # Final success log
+            success_log = StaffActivityLogCreate(
+                staff_id=actor_staff_id,
+                action=StaffActionEnum.create_record,
+                table_name="treatment_plans",
+                details=f"Created treatment plan ID: {db_plan.id} (v{db_plan.version_number}) with {display_order_counter} goals for patient ID: {patient_id}",
+                ip_address=request.client.host
+            )
+            staff_activity_log_controller.create_activity_log(db, log_data=success_log)
+
+            return get_plan_details(db=db, plan_id=db_plan.id)
+
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to save care plan to database. Please try again."
+            )
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        error_log = StaffActivityLogCreate(
+            staff_id=actor_staff_id,
+            action=StaffActionEnum.system_error,
+            table_name="treatment_plans",
+            details=f"Failed to generate care plan for patient ID: {patient_id}",
+            ip_address=request.client.host
+        )
+        staff_activity_log_controller.create_activity_log(db, log_data=error_log)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred during care plan generation"
+        )
+
+
+def create_care_plan_goal(db: Session, plan_id: int, goal_data: CarePlanGoalCreate, actor_staff_id: int, request: Request) -> CarePlanGoal:
+    """Creates a new goal with detailed logging."""
+    db_plan = db.query(TreatmentPlan).filter(TreatmentPlan.id == plan_id).first()
+    if not db_plan:
+        raise HTTPException(status_code=404, detail=f"Treatment plan with ID {plan_id} not found.")
+
+    try:
+        max_order = db.query(func.max(CarePlanGoal.display_order)).filter(CarePlanGoal.treatment_plan_id == plan_id).scalar()
+        next_order = (max_order + 1) if max_order is not None else 0
+
+        db_goal = CarePlanGoal(
+            **goal_data.model_dump(),
+            treatment_plan_id=plan_id,
+            display_order=next_order
+        )
+        db.add(db_goal)
+        db.commit()
+        db.refresh(db_goal)
+
+        # Detailed goal creation log
+        log_entry = StaffActivityLogCreate(
+            staff_id=actor_staff_id,
+            action=StaffActionEnum.create_record,
+            table_name="care_plan_goals",
+            details=(
+                f"Created new goal (ID: {db_goal.id}) for treatment plan ID: {plan_id}. "
+                f"Category: {db_goal.needs_category}. Goal: {db_goal.goal[:100]}..."
+            ),
+            ip_address=request.client.host
+        )
+        staff_activity_log_controller.create_activity_log(db, log_data=log_entry)
+
+        return db_goal
+    except Exception as e:
+        db.rollback()
+        error_log = StaffActivityLogCreate(
+            staff_id=actor_staff_id,
+            action=StaffActionEnum.system_error,
+            table_name="care_plan_goals",
+            details=f"Failed to create goal for plan ID: {plan_id}. Error: {str(e)}",
+            ip_address=request.client.host
+        )
+        staff_activity_log_controller.create_activity_log(db, log_data=error_log)
+        raise HTTPException(status_code=500, detail="Failed to create care plan goal")
+
+
+    
+# =========================================================================
+# === STANDARD CRUD & MANAGEMENT FUNCTIONS
+# =========================================================================
+
+def get_assessment_change_summary(db: Session, summary_id: int) -> AssessmentChangeSummary:
+    """Retrieves a single assessment change summary with its related data."""
+    summary = db.query(AssessmentChangeSummary).options(
+        joinedload(AssessmentChangeSummary.patient),
+        joinedload(AssessmentChangeSummary.previous_assessment).joinedload(PatientAssessment.assessment),
+        joinedload(AssessmentChangeSummary.current_assessment).joinedload(PatientAssessment.assessment)
+    ).filter(AssessmentChangeSummary.id == summary_id).first()
+    if not summary:
+        raise HTTPException(status_code=404, detail=f"Assessment change summary with ID {summary_id} not found.")
+    return summary
+
+def get_plans_for_patient(db: Session, patient_id: int) -> List[TreatmentPlan]:
+    """Retrieves all plans for a patient, eagerly loading associated goals."""
+    return db.query(TreatmentPlan).options(
+        joinedload(TreatmentPlan.patient),
+        joinedload(TreatmentPlan.patient_assessment).joinedload(PatientAssessment.assessment),
+        joinedload(TreatmentPlan.goals)
+    ).filter(TreatmentPlan.patient_id == patient_id).order_by(TreatmentPlan.version_number.asc()).all()
+
+
+def get_plan_details(db: Session, plan_id: int) -> Dict[str, Any]:
+    """
+    Retrieves a single, complete treatment plan with its goals,
+    and associated patient and assessment details.
+    """
+    plan = db.query(TreatmentPlan).options(
+        joinedload(TreatmentPlan.patient),
+        joinedload(TreatmentPlan.patient_assessment).joinedload(PatientAssessment.assessment),
+        joinedload(TreatmentPlan.goals) # Eagerly load the goals relationship
+    ).filter(TreatmentPlan.id == plan_id).first()
+
+    if not plan:
+        raise HTTPException(status_code=404, detail=f"Treatment plan with ID {plan_id} not found.")
+
+    # Fetch all scores related to the current assessment
+    scores = db.query(PatientAssessmentScore).filter(
+        PatientAssessmentScore.patient_assessment_id == plan.patient_assessment_id
+    ).all()
+
+    # Fetch all responses related to the current assessment
+    responses = db.query(PatientAssessmentResponse).options(
+        joinedload(PatientAssessmentResponse.question)
+    ).filter(PatientAssessmentResponse.patient_assessment_id == plan.patient_assessment_id).all()
+
+    # Consolidate QoL scores from PatientAssessmentScores
+    qol_scores_map = {s.domain: s.score for s in scores if "WHOQOL" in s.domain.upper() or "QUALITY OF LIFE" in s.domain.upper()}
+
+    # Create SOFS impaired domains as a list of strings
+    sofs_impaired_domains_list = []
+    for r in responses:
+        if r.question.question_code.startswith("SOFS_") and r.response_value and r.response_value != "1":
+            item_text = r.question.question_text
+            if r.selected_checklist_options:
+                try:
+                    # Handle both stringified JSON and direct list/dict
+                    options = json.loads(r.selected_checklist_options) if isinstance(r.selected_checklist_options, str) else r.selected_checklist_options
+                    if isinstance(options, list):
+                        item_text += f": {', '.join(options)}"
+                    else:
+                        item_text += f": {options}"
+                except (json.JSONDecodeError, TypeError):
+                    item_text += f": {r.selected_checklist_options}"
+            sofs_impaired_domains_list.append(item_text)
+
+    # Calculate overall WHODAS score
+    overall_whodas_score = next((s.score for s in scores if s.domain == "WHODAS 2.0 Overall Score"), None)
+    
+    # Calculate overall SOFS score
+    overall_sofs_score = next((s.score for s in scores if "SOFS OVERALL" in s.domain.upper()), None)
+
+    # Fetch latest psychopathology_status from PatientObservation
+    latest_observation = db.query(PatientObservation).filter(PatientObservation.patient_id == plan.patient_id).order_by(PatientObservation.observation_date.desc()).first()
+    
+    return {
+        "id": plan.id,
+        "patient_id": plan.patient_id,
+        "patient_name": plan.patient.name if plan.patient else "N/A",
+        "patient_assessment_id": plan.patient_assessment_id,
+        "assessment_name": plan.patient_assessment.assessment.assessment_name if plan.patient_assessment and plan.patient_assessment.assessment else "N/A",
+        "assessment_change_summary_id": plan.assessment_change_summary_id,
+        "created_at": plan.created_at.isoformat(),
+        "updated_at": plan.updated_at.isoformat(),
+        "plan_start_date": plan.plan_start_date.isoformat(),
+        "review_date": plan.review_date.isoformat() if plan.review_date else None,
+        "version_number": plan.version_number,
+        "status": plan.status,
+        
+        # Summaries and Notes
+        "brief_background_summary": plan.brief_background_summary,
+        "disability_and_functioning_summary": plan.disability_and_functioning_summary,
+        "strengths_and_aspirations_summary": plan.strengths_and_aspirations_summary,
+        "risks_and_concerns": plan.risks_and_concerns,
+        "additional_notes": plan.additional_notes,
+        "care_plan_edit_summary": plan.care_plan_edit_summary,
+
+        # Patient Details
+        "patient_unique_id": str(plan.patient_id),
+        "patient_age": plan.patient.age if plan.patient else None,
+        "patient_gender": plan.patient.gender if plan.patient else None,
+        "patient_date_of_admission": plan.patient.date_of_admission.isoformat() if plan.patient and plan.patient.date_of_admission else None,
+        
+        # Assessment Details
+        "diagnosis": plan.patient.current_provisional_diagnosis if plan.patient else None,
+        "psychopathology_status": latest_observation.psychopathology_status if latest_observation else None,
+        "known_comorbidities": plan.patient.known_comorbidities if plan.patient else None,
+        "assessment_date": plan.patient_assessment.assessment_date.isoformat() if plan.patient_assessment and plan.patient_assessment.assessment_date else None,
+
+        # Calculated Scores
+        "overall_whodas_score": overall_whodas_score,
+        "overall_sofs_score": overall_sofs_score,
+        "sofs_impaired_domains": sofs_impaired_domains_list,
+        "overall_qol_score": qol_scores_map.get("WHOQoL Overall Quality of Life"),
+        "overall_general_health_score": qol_scores_map.get("WHOQoL General Health"),
+        "qol_physical_health_score": qol_scores_map.get("WHOQoL Physical Health"),
+        "qol_physiological_score": qol_scores_map.get("WHOQoL Psychological"),
+        "qol_social_relationships_score": qol_scores_map.get("WHOQoL Social Relationships"),
+        "qol_environment_score": qol_scores_map.get("WHOQoL Environment"),
+        
+        # Full data lists for detailed views
+        "scores": [{"domain": s.domain, "score": s.score, "score_interpretation": s.score_interpretation} for s in scores],
+        "responses": [
+            {
+                "question_code": r.question.question_code,
+                "question_text": r.question.question_text,
+                "question_domain": r.question.domain,
+                "response_value": r.response_value,
+                "selected_checklist_options": json.loads(r.selected_checklist_options) if isinstance(r.selected_checklist_options, str) and r.selected_checklist_options else r.selected_checklist_options or []
+            } for r in responses
+        ],
+        "goals": [
+            {
+                "id": goal.id,
+                "treatment_plan_id": goal.treatment_plan_id,
+                "needs_category": goal.needs_category,
+                "goal": goal.goal,
+                "intervention": goal.intervention,
+                "rationale": goal.rationale,
+                "display_order": goal.display_order
+            }
+            # Sort goals by their display_order to ensure consistent UI rendering
+            for goal in sorted(plan.goals, key=lambda g: g.display_order)
+        ],
+    }
+    
+def get_plan_by_assessment(db: Session, assessment_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Retrieves a plan associated with a specific assessment and formats it
+    as a detailed dictionary.
+    """
+    # First, find the plan associated with the assessment ID
+    plan = db.query(TreatmentPlan).filter(
+        TreatmentPlan.patient_assessment_id == assessment_id
+    ).first()
+
+    # If no plan is found, return None
+    if not plan:
+        return None
+
+    # If a plan is found, use the existing get_plan_details function to
+    # build the correct, detailed dictionary structure.
+    return get_plan_details(db, plan.id)
+
+def update_treatment_plan(db: Session, plan_id: int, plan_update_data: TreatmentPlanUpdate, actor_staff_id: int, request: Request) -> Dict[str, Any]:
+    """Updates treatment plan, synchronizes the review reminder, and logs all changes."""
+    db_plan_obj = db.query(TreatmentPlan).options(
+        joinedload(TreatmentPlan.patient) # Eager load patient for institution_id
+    ).filter(TreatmentPlan.id == plan_id).first()
+    
+    if not db_plan_obj:
+        raise HTTPException(status_code=404, detail=f"Treatment plan with ID {plan_id} not found.")
+
+    update_data = plan_update_data.model_dump(exclude_unset=True)
+    change_details = []
+    
+    # --- Store the original review date before any changes ---
+    old_review_date = db_plan_obj.review_date
+
+    for field, new_value in update_data.items():
+        old_value = getattr(db_plan_obj, field)
+        if str(old_value) != str(new_value):
+            change_details.append(f"{field}: '{old_value}' → '{new_value}'")
+            setattr(db_plan_obj, field, new_value)
+
+    # --- START: REMINDER SYNCHRONIZATION LOGIC ---
+    if 'review_date' in update_data:
+        new_review_date = update_data['review_date']
+        
+        # Find the specific pending review reminder associated with the old date
+        review_reminder = db.query(Reminder).filter(
+            Reminder.patient_id == db_plan_obj.patient_id,
+            Reminder.status == 'pending',
+            Reminder.reminder_text.like(f"Care plan review due for resident (ID: {db_plan_obj.patient_id})%"),
+            Reminder.reminder_date == old_review_date
+        ).first()
+
+        if review_reminder:
+            # If a reminder exists, update its date
+            review_reminder.reminder_date = new_review_date
+            change_details.append(f"Associated reminder date updated from '{old_review_date}' to '{new_review_date}'")
+        elif new_review_date:
+            # If no reminder was found but a new date is set, create one
+            db.add(Reminder(
+                institution_id=db_plan_obj.patient.institution_id,
+                patient_id=db_plan_obj.patient_id,
+                staff_id=actor_staff_id,
+                reminder_text=f"Care plan review due for resident (ID: {db_plan_obj.patient_id})",
+                reminder_date=new_review_date,
+                status='pending'
+            ))
+            change_details.append(f"New care plan review reminder created for date '{new_review_date}'")
+    # --- END: REMINDER SYNCHRONIZATION LOGIC ---
+
+    if not change_details:
+        return get_plan_details(db=db, plan_id=plan_id)
+
+    try:
+        db.commit()
+        
+        # Log the update with all changes
+        log_entry = StaffActivityLogCreate(
+            staff_id=actor_staff_id,
+            action=StaffActionEnum.update_record,
+            table_name="treatment_plans",
+            details=(
+                f"Updated treatment plan ID: {plan_id} for Patient ID: {db_plan_obj.patient_id}. "
+                f"Changes: {', '.join(change_details)}."
+            ),
+            ip_address=request.client.host
+        )
+        staff_activity_log_controller.create_activity_log(db, log_data=log_entry)
+
+        return get_plan_details(db=db, plan_id=plan_id)
+    except Exception as e:
+        db.rollback()
+        error_log = StaffActivityLogCreate(
+            staff_id=actor_staff_id,
+            action=StaffActionEnum.system_error,
+            table_name="treatment_plans",
+            details=f"Failed to update plan ID: {plan_id}. Error: {str(e)}",
+            ip_address=request.client.host
+        )
+        staff_activity_log_controller.create_activity_log(db, log_data=error_log)
+        raise HTTPException(status_code=500, detail="Failed to update treatment plan")
+
+
+def delete_treatment_plan(db: Session, plan_id: int, actor_staff_id: int, request: Request) -> Dict[str, str]:
+    """Deletes treatment plan with concise logging including patient name."""
+    db_plan = db.query(TreatmentPlan).options(
+        joinedload(TreatmentPlan.patient)
+    ).filter(TreatmentPlan.id == plan_id).first()
+    
+    if not db_plan:
+        raise HTTPException(status_code=404, detail=f"Treatment plan with ID {plan_id} not found.")
+
+    try:
+        # Get patient name
+        patient_name = db_plan.patient.name if db_plan.patient else "Unknown"
+
+        # Single log entry with all relevant details including patient name
+        log_entry = StaffActivityLogCreate(
+            staff_id=actor_staff_id,
+            action=StaffActionEnum.delete_record,
+            table_name="treatment_plans",
+            details=(
+                f"Deleted treatment plan ID: {plan_id} | "
+                f"Patient: {patient_name} (ID: {db_plan.patient_id}) | "
+                f"Version: {db_plan.version_number} | "
+                f"Goals: {len(db_plan.goals)}"
+            ),
+            ip_address=request.client.host
+        )
+        staff_activity_log_controller.create_activity_log(db, log_data=log_entry)
+
+        if db_plan.assessment_change_summary_id:
+            summary_to_delete = db.query(AssessmentChangeSummary).filter(
+                AssessmentChangeSummary.id == db_plan.assessment_change_summary_id
+            ).first()
+            if summary_to_delete:
+                db.delete(summary_to_delete)
+
+        db.delete(db_plan)
+        db.commit()
+
+        return {"message": "Treatment plan and all associated data deleted successfully"}
+    except Exception as e:
+        db.rollback()
+        error_log = StaffActivityLogCreate(
+            staff_id=actor_staff_id,
+            action=StaffActionEnum.system_error,
+            table_name="treatment_plans",
+            details=f"Failed to delete treatment plan ID: {plan_id} for patient {patient_name}",
+            ip_address=request.client.host
+        )
+        staff_activity_log_controller.create_activity_log(db, log_data=error_log)
+        raise HTTPException(status_code=500, detail=f"Failed to delete treatment plan: {e}")
+
+    
+    
+def delete_care_plan_goal(db: Session, goal_id: int, actor_staff_id: int, request: Request) -> Dict[str, str]:
+    """Deletes a goal with detailed logging."""
+    db_goal = db.query(CarePlanGoal).filter(CarePlanGoal.id == goal_id).first()
+    if not db_goal:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Care plan goal with ID {goal_id} not found.")
+
+    try:
+        # Log before deletion
+        log_entry = StaffActivityLogCreate(
+            staff_id=actor_staff_id,
+            action=StaffActionEnum.delete_record,
+            table_name="care_plan_goals",
+            details=(
+                f"Deleting goal ID: {goal_id} from plan ID: {db_goal.treatment_plan_id}. "
+                f"Goal was: '{db_goal.goal[:100]}...'"
+            ),
+            ip_address=request.client.host
+        )
+        staff_activity_log_controller.create_activity_log(db, log_data=log_entry)
+
+        db.delete(db_goal)
+        db.commit()
+
+        return {"message": "Goal deleted successfully"}
+    except Exception as e:
+        db.rollback()
+        error_log = StaffActivityLogCreate(
+            staff_id=actor_staff_id,
+            action=StaffActionEnum.system_error,
+            table_name="care_plan_goals",
+            details=f"Failed to delete goal ID: {goal_id}. Error: {str(e)}",
+            ip_address=request.client.host
+        )
+        staff_activity_log_controller.create_activity_log(db, log_data=error_log)
+        raise HTTPException(status_code=500, detail="Failed to delete care plan goal")
+
+def reorder_care_plan_goals(db: Session, plan_id: int, reorder_data: GoalReorderRequest, actor_staff_id: int, request: Request):
+    """Logs goal reordering operations."""
+    db_plan = db.query(TreatmentPlan).filter(TreatmentPlan.id == plan_id).first()
+    if not db_plan:
+        raise HTTPException(status_code=404, detail=f"Treatment plan with ID {plan_id} not found.")
+
+    goals = db.query(CarePlanGoal).filter(CarePlanGoal.treatment_plan_id == plan_id).all()
+    goal_map = {goal.id: goal for goal in goals}
+
+    if set(goal_map.keys()) != set(reorder_data.goal_ids):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The provided goal IDs do not match the goals in the treatment plan."
+        )
+
+    try:
+        for index, goal_id in enumerate(reorder_data.goal_ids):
+            if goal_id in goal_map:
+                goal_map[goal_id].display_order = index
+
+        db.commit()
+
+        # Log the reordering
+        log_entry = StaffActivityLogCreate(
+            staff_id=actor_staff_id,
+            action=StaffActionEnum.update_record,
+            table_name="care_plan_goals",
+            details=(
+                f"Reordered {len(reorder_data.goal_ids)} goals in treatment plan ID: {plan_id}. "
+                f"New order: {', '.join(map(str, reorder_data.goal_ids))}"
+            ),
+            ip_address=request.client.host
+        )
+        staff_activity_log_controller.create_activity_log(db, log_data=log_entry)
+
+        return {"message": "Goals reordered successfully"}
+    except Exception as e:
+        db.rollback()
+        error_log = StaffActivityLogCreate(
+            staff_id=actor_staff_id,
+            action=StaffActionEnum.system_error,
+            table_name="care_plan_goals",
+            details=f"Failed to reorder goals in plan ID: {plan_id}. Error: {str(e)}",
+            ip_address=request.client.host
+        )
+        staff_activity_log_controller.create_activity_log(db, log_data=error_log)
+        raise HTTPException(status_code=500, detail="Failed to reorder care plan goals")
+
+# controllers/treatment_plan_controller.py
+
+def update_care_plan_goal(db: Session, goal_id: int, goal_update_data: CarePlanGoalUpdate, actor_staff_id: int, request: Request) -> CarePlanGoal:
+    """Updates a goal with detailed change tracking."""
+    db_goal = db.query(CarePlanGoal).filter(CarePlanGoal.id == goal_id).first()
+    if not db_goal:
+        raise HTTPException(status_code=404, detail=f"Care plan goal with ID {goal_id} not found.")
+
+    update_data = goal_update_data.model_dump(exclude_unset=True)
+    change_details = []
+
+    for key, value in update_data.items():
+        old_value = getattr(db_goal, key)
+        if str(old_value) != str(value):
+            change_details.append(f"{key}: '{old_value}' → '{value}'")
+            setattr(db_goal, key, value)
+
+    if not change_details:
+        return db_goal
+
+    try:
+        db.commit()
+        
+        # Log the goal update
+        log_entry = StaffActivityLogCreate(
+            staff_id=actor_staff_id,
+            action=StaffActionEnum.update_record,
+            table_name="care_plan_goals",
+            details=(
+                f"Updated goal ID: {goal_id} in plan ID: {db_goal.treatment_plan_id}. "
+                f"Changes: {', '.join(change_details)}"
+            ),
+            ip_address=request.client.host
+        )
+        staff_activity_log_controller.create_activity_log(db, log_data=log_entry)
+
+        return db_goal
+    except Exception as e:
+        db.rollback()
+        error_log = StaffActivityLogCreate(
+            staff_id=actor_staff_id,
+            action=StaffActionEnum.system_error,
+            table_name="care_plan_goals",
+            details=f"Failed to update goal ID: {goal_id}. Error: {str(e)}",
+            ip_address=request.client.host
+        )
+        staff_activity_log_controller.create_activity_log(db, log_data=error_log)
+        raise HTTPException(status_code=500, detail="Failed to update care plan goal")
